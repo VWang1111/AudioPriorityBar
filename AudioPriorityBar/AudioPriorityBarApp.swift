@@ -92,6 +92,7 @@ class AudioManager: ObservableObject {
     private var micFlashTimer: Timer?
     let priorityManager = PriorityManager()
     private var connectedDeviceUIDs: Set<String> = []
+    private var isHandlingDeviceChange = false
 
     var menuBarIcon: String {
         currentMode.icon
@@ -192,6 +193,7 @@ class AudioManager: ObservableObject {
         for device in allConnectedDevices {
             priorityManager.rememberDevice(device.uid, name: device.name, isInput: device.type == .input)
         }
+        priorityManager.consolidateDuplicates(connectedUIDs: connectedDeviceUIDs)
         let connectedInputs = allConnectedDevices.filter { $0.type == .input }
         let connectedOutputs = allConnectedDevices.filter { $0.type == .output }
 
@@ -386,11 +388,13 @@ class AudioManager: ObservableObject {
     }
 
     private func applyInputDevice(_ device: AudioDevice) {
+        guard device.id != currentInputId else { return }
         deviceService.setDefaultDevice(device.id, type: .input)
         currentInputId = device.id
     }
 
     private func applyOutputDevice(_ device: AudioDevice) {
+        guard device.id != currentOutputId else { return }
         deviceService.setDefaultDevice(device.id, type: .output)
         currentOutputId = device.id
     }
@@ -415,18 +419,37 @@ class AudioManager: ObservableObject {
                 self?.handleDeviceChange()
             }
         }
+        deviceService.onDefaultDeviceChanged = { [weak self] in
+            Task { @MainActor in
+                self?.handleDefaultDeviceChange()
+            }
+        }
         deviceService.startListening()
     }
 
+    private func handleDefaultDeviceChange() {
+        currentInputId = deviceService.getCurrentDefaultDevice(type: .input)
+        currentOutputId = deviceService.getCurrentDefaultDevice(type: .output)
+        refreshVolume()
+        refreshMuteStatus()
+        if !isCustomMode {
+            applyHighestPriorityInput()
+        }
+    }
+
     private func handleDeviceChange() {
+        guard !isHandlingDeviceChange else { return }
+        isHandlingDeviceChange = true
+        defer { isHandlingDeviceChange = false }
+
         let oldConnectedUIDs = previousConnectedUIDs
         refreshDevices()
         refreshMuteStatus()
-        
+
         // Detect newly connected devices
         let newlyConnectedUIDs = connectedDeviceUIDs.subtracting(oldConnectedUIDs)
         previousConnectedUIDs = connectedDeviceUIDs
-        
+
         if !isCustomMode {
             // Auto-switch mode only when a new headphone connects or all headphones disconnect
             autoSwitchModeIfNeeded(newlyConnectedUIDs: newlyConnectedUIDs)

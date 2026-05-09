@@ -115,6 +115,7 @@ struct MenuBarView: View {
                     .foregroundColor(audioManager.isEditMode ? .accentColor : .secondary)
                 }
                 .buttonStyle(.plain)
+                .help(audioManager.isEditMode ? "Exit edit mode" : "Edit priority order — includes disconnected devices")
                 .animation(.easeInOut(duration: 0.2), value: audioManager.isEditMode)
 
                 // Quit button
@@ -133,6 +134,8 @@ struct MenuBarView: View {
             .animation(.easeInOut(duration: 0.2), value: audioManager.isEditMode)
         }
         .frame(width: 340)
+        .frame(maxHeight: 560)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

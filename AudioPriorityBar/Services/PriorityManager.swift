@@ -32,7 +32,11 @@ struct StoredDevice: Codable, Equatable {
 }
 
 class PriorityManager {
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
 
     private let inputPrioritiesKey = "inputPriorities"
     private let speakerPrioritiesKey = "speakerPriorities"
@@ -78,6 +82,87 @@ class PriorityManager {
     private func saveKnownDevices(_ devices: [StoredDevice]) {
         if let data = try? JSONEncoder().encode(devices) {
             defaults.set(data, forKey: knownDevicesKey)
+        }
+    }
+
+    /// Some devices (notably HDMI/DisplayPort display audio like the Samsung
+    /// C34J79x) report a fresh UID every reconnect, so without this we
+    /// accumulate dozens of duplicate "known device" entries with the same
+    /// name. Group by (name, isInput); for each duplicate group, keep the one
+    /// that's currently connected (or the most recently seen if none are), and
+    /// migrate UIDs in every priority/hide/category list so the survivor
+    /// inherits the user's settings.
+    func consolidateDuplicates(connectedUIDs: Set<String>) {
+        let known = getKnownDevices()
+        var groups: [String: [StoredDevice]] = [:]
+        for device in known {
+            let key = "\(device.isInput ? "in" : "out")|\(device.name)"
+            groups[key, default: []].append(device)
+        }
+
+        var survivors: [StoredDevice] = []
+        var migrations: [(from: String, to: String)] = []
+
+        for (_, entries) in groups {
+            guard entries.count > 1 else {
+                survivors.append(contentsOf: entries)
+                continue
+            }
+            let connected = entries.filter { connectedUIDs.contains($0.uid) }
+            // Two devices with the same name both physically present is rare
+            // but possible — assume they're distinct hardware and leave alone.
+            if connected.count > 1 {
+                survivors.append(contentsOf: entries)
+                continue
+            }
+            let survivor = connected.first ?? entries.max(by: { $0.lastSeen < $1.lastSeen })!
+            survivors.append(survivor)
+            for entry in entries where entry.uid != survivor.uid {
+                migrations.append((from: entry.uid, to: survivor.uid))
+            }
+        }
+
+        guard !migrations.isEmpty else { return }
+
+        // Preserve original ordering of survivors as much as possible by
+        // re-walking the original list and keeping the first survivor seen per
+        // group key.
+        var seenSurvivorUIDs = Set(survivors.map { $0.uid })
+        var orderedSurvivors: [StoredDevice] = []
+        for device in known where seenSurvivorUIDs.contains(device.uid) {
+            orderedSurvivors.append(device)
+            seenSurvivorUIDs.remove(device.uid)
+        }
+        saveKnownDevices(orderedSurvivors)
+
+        for (from, to) in migrations {
+            migrateUID(from: from, to: to)
+        }
+    }
+
+    private func migrateUID(from oldUID: String, to newUID: String) {
+        let arrayKeys = [
+            inputPrioritiesKey, speakerPrioritiesKey, headphonePrioritiesKey,
+            hiddenMicsKey, hiddenSpeakersKey, hiddenHeadphonesKey, neverUseKey
+        ]
+        for key in arrayKeys {
+            guard var arr = defaults.array(forKey: key) as? [String] else { continue }
+            if arr.contains(newUID) {
+                arr.removeAll { $0 == oldUID }
+            } else if let idx = arr.firstIndex(of: oldUID) {
+                arr[idx] = newUID
+            } else {
+                continue
+            }
+            defaults.set(arr, forKey: key)
+        }
+        if var categories = defaults.dictionary(forKey: deviceCategoriesKey) as? [String: String],
+           let cat = categories[oldUID] {
+            categories.removeValue(forKey: oldUID)
+            if categories[newUID] == nil {
+                categories[newUID] = cat
+            }
+            defaults.set(categories, forKey: deviceCategoriesKey)
         }
     }
 
@@ -250,7 +335,34 @@ class PriorityManager {
     }
 
     private func savePriorities(_ devices: [AudioDevice], key: String) {
-        let uids = devices.map { $0.uid }
-        defaults.set(uids, forKey: key)
+        // Merge new ordering into the existing saved list so that disconnected,
+        // hidden, and never-use devices keep their saved positions even when the
+        // user reorders only the subset currently visible in the menu.
+        let newOrder = devices.map { $0.uid }
+        let displayed = Set(newOrder)
+        let existing = defaults.array(forKey: key) as? [String] ?? []
+
+        var result: [String] = []
+        var newIter = newOrder.makeIterator()
+
+        for oldUID in existing {
+            if displayed.contains(oldUID) {
+                if let next = newIter.next() {
+                    result.append(next)
+                }
+            } else {
+                result.append(oldUID)
+            }
+        }
+
+        // Append any new UIDs that weren't in the existing saved list (e.g.
+        // first time we've seen this device).
+        while let next = newIter.next() {
+            if !result.contains(next) {
+                result.append(next)
+            }
+        }
+
+        defaults.set(result, forKey: key)
     }
 }
